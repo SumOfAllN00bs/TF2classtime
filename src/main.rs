@@ -5,6 +5,7 @@ use eframe::egui;
 use reqwest::Error;
 use rusqlite::{Connection, Result};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use std::{thread, time};
 
 #[derive(Debug)]
@@ -227,12 +228,14 @@ struct EframeExampleApp {
     initial_profile_id: String,
     run_limit: i32,
     enabled_button: bool,
+    running: Arc<Mutex<bool>>,
 }
 
 impl EframeExampleApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         EframeExampleApp {
             enabled_button: false,
+            running: Arc::new(Mutex::new(false)),
             ..Default::default()
         }
     }
@@ -263,20 +266,31 @@ impl eframe::App for EframeExampleApp {
                     self.enabled_button = true;
                 }
                 ui.add(egui::Slider::new(&mut self.run_limit, 1..=10000).text("limits"));
-                if self.enabled_button {
-                    if ui.button("Run").clicked() {
-                        self.enabled_button = false;
-                        let temp_string = self.steam_key_text.clone();
-                        let temp_initial_id = self.initial_profile_id.clone();
-                        let temp_limit = self.run_limit;
-                        tokio::spawn(async move {
-                            match run_it(temp_string, temp_initial_id, temp_limit).await {
-                                Ok(response) => response,
-                                Err(error) => panic!("my errors: {:?}", error),
-                            };
-                        });
+                let mut run = self.running.lock().unwrap();
+                if !*run {
+                    if self.enabled_button {
+                        if ui.button("Run").clicked() {
+                            self.enabled_button = false;
+                            *run = true;
+                            let temp_string = self.steam_key_text.clone();
+                            let temp_initial_id = self.initial_profile_id.clone();
+                            let temp_limit = self.run_limit;
+                            let run_clone = Arc::clone(&self.running);
+                            tokio::spawn(async move {
+                                match run_it(run_clone, temp_string, temp_initial_id, temp_limit)
+                                    .await
+                                {
+                                    Ok(response) => response,
+                                    Err(error) => panic!("my errors: {:?}", error),
+                                };
+                            });
+                        }
+                    } else if ui.add_enabled(false, egui::Button::new("Run")).clicked() {
                     }
-                } else if ui.add_enabled(false, egui::Button::new("Run")).clicked() {
+                } else if ui
+                    .add_enabled(false, egui::Button::new("Processing..."))
+                    .clicked()
+                {
                 }
             });
         });
@@ -284,6 +298,7 @@ impl eframe::App for EframeExampleApp {
 }
 
 async fn run_it(
+    run: Arc<Mutex<bool>>,
     steam_key: String,
     initial_profile_id: String,
     run_limit: i32,
@@ -329,23 +344,23 @@ async fn run_it(
             continue;
         }
 
-        // // get the friends of current profile
-        // let friends_list = match get_user_friends(steam_key.as_str(), profile.as_str()).await {
-        //     Ok(response) => response,
-        //     Err(_error) => {
-        //         delete_unchecked_profile(&mut conn, profile.clone())?;
-        //         continue;
-        //     }
-        // };
-        // // need to keep indexing unique
-        // let mut unchecked_count = get_unchecked_profiles_last_row_id(&mut conn)?;
-        // for friend in &friends_list.friendslist.friends {
-        //     conn.execute(
-        //         "INSERT INTO steamids_unchecked (id, steamid) VALUES (?1, ?2)",
-        //         (&unchecked_count + 1, &friend.steamid),
-        //     )?;
-        //     unchecked_count = unchecked_count + 1;
-        // }
+        // get the friends of current profile
+        let friends_list = match get_user_friends(steam_key.as_str(), profile.as_str()).await {
+            Ok(response) => response,
+            Err(_error) => {
+                delete_unchecked_profile(&mut conn, profile.clone())?;
+                continue;
+            }
+        };
+        // need to keep indexing unique
+        let mut unchecked_count = get_unchecked_profiles_last_row_id(&mut conn)?;
+        for friend in &friends_list.friendslist.friends {
+            conn.execute(
+                "INSERT INTO steamids_unchecked (id, steamid) VALUES (?1, ?2)",
+                (&unchecked_count + 1, &friend.steamid),
+            )?;
+            unchecked_count = unchecked_count + 1;
+        }
         // insert into checked, to keep track of already processed profiles
         // also for foreign key to TF2stats
         let checked_count = get_checked_profiles_last_row_id(&mut conn)?;
@@ -375,6 +390,8 @@ async fn run_it(
         // processed a profile, remove current from steamids_unchecked
         delete_unchecked_profile(&mut conn, profile.clone())?;
     }
+    let mut running = run.lock().unwrap();
+    *running = false;
     println!("DONE!!!!");
     Ok(())
 }
